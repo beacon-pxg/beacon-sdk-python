@@ -1,0 +1,17 @@
+name: Test
+
+# The SDK against a fake agent; Beacon's CI also runs it against the real agent (TestSDKContract).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run python -m unittest discover -s tests -v

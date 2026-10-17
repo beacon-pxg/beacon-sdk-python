@@ -23,4 +23,16 @@ Scrapers also get `secrets()` (the source's cookies and proxy, never stored on d
 (call it before each request to the site: it respects the source's rate limit) and
 `discover_releases()` / `discover_works()` for `check` and `scrape` jobs.
 
-Status: v0.3, the whole contract of `docs/05-workers.md` §6.
+`self_check(binaries=[...], config=[...])` returns what's wrong at start-up (missing binaries or
+installation config keys); the worker decides whether to exit.
+
+## Tests
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+They run against a fake agent (`tests/fake_agent.py`). Beacon's CI also runs the SDK against the real
+agent (`TestSDKContract` in `beacon/cmd/beacon-agent`).
+
+Status: v0.4, the whole contract of `docs/05-workers.md` §6.

@@ -87,7 +87,11 @@ class Worker:
             with urllib.request.urlopen(req, timeout=timeout) as res:
                 env = json.load(res)
         except urllib.error.HTTPError as e:
-            env = json.load(e)
+            with e:  # an error response holds a socket too
+                try:
+                    env = json.load(e)
+                except ValueError:
+                    env = {"code": "bad_response", "message": e.reason}
             raise AgentError(e.code, env.get("code", ""), env.get("message", "")) from None
         return env.get("data")
 
@@ -132,6 +136,14 @@ class Worker:
             if wait > 0:
                 time.sleep(wait)
             self._next_request = max(time.monotonic(), self._next_request) + self._gap
+
+    def self_check(self, binaries: tuple[str, ...] | list[str] = (), config: tuple[str, ...] | list[str] = ()) -> list[str]:
+        """The common start-up checks: binaries on PATH and keys present in the installation config.
+        Returns what's wrong ([] when all is well); the worker decides whether to exit."""
+        problems = [f"binary not found: {b}" for b in check_binaries(*binaries)]
+        installation = (self.config() or {}).get("installation") or {}
+        problems += [f"config key missing: {k}" for k in config if installation.get(k) in (None, "")]
+        return problems
 
     def discover_releases(self, job: Job, releases: list[dict], work: dict | None = None) -> int:
         """Report a check's releases ([{number, title?, url?, published_at?}]) and, on the first check,
