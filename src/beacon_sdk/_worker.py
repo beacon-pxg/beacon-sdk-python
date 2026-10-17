@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import shutil
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Iterator
+
+HEARTBEAT_S = 10
+CLAIM_WAIT_S = 30
+
+
+class Retryable(Exception):
+    """Fail the job; Beacon retries it."""
+
+
+class NeedsReview(Exception):
+    """Fail the job and send its release to review with this reason."""
+
+
+class AgentError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(f"{status} {code}: {message}")
+        self.status, self.code = status, code
+
+
+@dataclass
+class Job:
+    """A claimed job (docs/05-workers.md §4)."""
+
+    id: str
+    type: str
+    attempt: int
+    payload: dict
+    inputs: list
+    params: dict
+    out_dir: str
+    idempotency_key: str = ""
+    _done: bool = field(default=False, repr=False)
+
+
+class Worker:
+    """Connects to the agent (BEACON_AGENT_URL / BEACON_WORKER_TOKEN) and heartbeats in the background."""
+
+    def __init__(self) -> None:
+        try:
+            self._url = os.environ["BEACON_AGENT_URL"].rstrip("/")
+            self._token = os.environ["BEACON_WORKER_TOKEN"]
+        except KeyError as e:
+            raise SystemExit(f"beacon_sdk: {e.args[0]} isn't set: run the worker through the Beacon agent") from None
+        self.id = os.environ.get("BEACON_WORKER_ID", "")
+        self.work_root = os.environ.get("BEACON_WORK_ROOT", ".")
+        self._stop = threading.Event()
+        self._cancel: set[str] = set()
+        self._current: Job | None = None
+        self._throttle_lock = threading.Lock()
+        self._next_request, self._gap, self._rate_checked = 0.0, 0.0, -1e9
+        self._beat()
+        threading.Thread(target=self._heartbeat_loop, name="beacon-heartbeat", daemon=True).start()
+        # A job is never left without a final call: an exception that ends the program fails it with
+        # the outcome its type chooses; any other exit fails it as retryable.
+        prev = sys.excepthook
+
+        def hook(t, e, tb):
+            if isinstance(e, NeedsReview):
+                self._abandon(str(e), retryable=False, review=str(e))
+            else:
+                self._abandon(f"{t.__name__}: {e}", retryable=True)
+            prev(t, e, tb)
+
+        sys.excepthook = hook
+        atexit.register(self._abandon, "the worker exited mid-job", True)
+
+    # ---- transport ----
+
+    def _call(self, method: str, path: str, body: Any = None, timeout: float = 40) -> Any:
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self._url + path, data=data, method=method,
+                                     headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                env = json.load(res)
+        except urllib.error.HTTPError as e:
+            env = json.load(e)
+            raise AgentError(e.code, env.get("code", ""), env.get("message", "")) from None
+        return env.get("data")
+
+    def _beat(self) -> None:
+        data = self._call("POST", "/heartbeat", {}) or {}
+        if data.get("stop_requested"):
+            self._stop.set()
+        self._cancel = set(data.get("cancel") or [])
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(HEARTBEAT_S)
+            try:
+                self._beat()
+            except Exception as e:  # the agent restarts us if we go quiet for too long
+                print(f"beacon_sdk: heartbeat failed: {e}", file=sys.stderr)
+
+    # ---- runtime ----
+
+    def should_stop(self, job: Job | None = None) -> bool:
+        """True once the agent asked the worker to stop, or Beacon to cancel that job."""
+        return self._stop.is_set() or (job is not None and job.id in self._cancel)
+
+    def config(self) -> dict:
+        """{"installation": {...}, "source": {...} | None}"""
+        return self._call("GET", "/config")
+
+    def secrets(self) -> dict:
+        """{"cookies": str | None, "proxy_url": str | None} of the worker's source. Never store them on disk."""
+        return self._call("GET", "/secrets")
+
+    def throttle(self) -> None:
+        """Blocks as needed to respect the source's rate_limit; call it before each request to the site."""
+        now = time.monotonic()
+        if self._rate_checked + 60 < now:  # the source's settings can change while the worker runs
+            src = (self.config() or {}).get("source") or {}
+            rl = src.get("rate_limit") or {}
+            self._gap = rl["per_s"] / rl["requests"] if rl.get("requests") and rl.get("per_s") else 0.0
+            self._rate_checked = now
+        with self._throttle_lock:
+            wait = self._next_request - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self._next_request = max(time.monotonic(), self._next_request) + self._gap
+
+    def discover_releases(self, job: Job, releases: list[dict], work: dict | None = None) -> int:
+        """Report a check's releases ([{number, title?, url?, published_at?}]) and, on the first check,
+        the work's {title, external_id}. Returns how many were new."""
+        new = 0
+        for i in range(0, max(len(releases), 1), 500):
+            data = self._call("POST", "/discover/releases", {"job_id": job.id, "work_id": job.payload["work"]["id"],
+                                                             "work": work or {}, "releases": releases[i:i + 500]})
+            new += (data or {}).get("new", 0)
+        return new
+
+    def discover_works(self, job: Job, works: list[dict]) -> int:
+        """Report a batch of a scrape's works ([{url, external_id?, title?}]). Returns how many were new."""
+        new = 0
+        for i in range(0, len(works), 500):
+            data = self._call("POST", "/discover/works", {"job_id": job.id, "works": works[i:i + 500]})
+            new += (data or {}).get("new", 0)
+        return new
+
+    # ---- jobs ----
+
+    def jobs(self) -> Iterator[Job]:
+        """Jobs for this worker, one at a time; ends when the agent asks to stop."""
+        while not self._stop.is_set():
+            try:
+                data = self._call("POST", "/jobs/claim", {"wait_s": CLAIM_WAIT_S}, timeout=CLAIM_WAIT_S + 15)
+            except (AgentError, OSError) as e:
+                print(f"beacon_sdk: claim failed: {e}", file=sys.stderr)
+                self._stop.wait(5)
+                continue
+            if not data:
+                continue
+            job = Job(id=data["id"], type=data["type"], attempt=data.get("attempt", 1), payload=data.get("payload") or {},
+                      inputs=data.get("inputs") or [], params=data.get("params") or {}, out_dir=data["out_dir"],
+                      idempotency_key=data.get("idempotency_key", ""))
+            self._current = job
+            yield job  # an exception in the loop body ends the program: the excepthook fails the job
+            if not job._done:
+                self.fail(job, "the worker moved on without finishing the job", retryable=True)
+
+    def progress(self, job: Job, pct: int, message: str = "") -> None:
+        self._job_call(job, "progress", {"pct": int(pct), "message": message})
+
+    def log(self, job: Job, level: str, message: str, **fields: Any) -> None:
+        self._job_call(job, "log", {"level": level, "message": message, "fields": fields})
+
+    def output(self, job: Job, port: str, path: str) -> None:
+        """Register a file in job.out_dir as the output for a pipeline port (e.g. "video")."""
+        self._job_call(job, "outputs", {"port": port, "path": os.path.abspath(path)})
+
+    def complete(self, job: Job, result: Any = None) -> None:
+        self._finish(job, "complete", {"result": result})
+
+    def fail(self, job: Job, error: str, retryable: bool = True, review: str | None = None) -> None:
+        self._finish(job, "fail", {"error": str(error), "retryable": retryable, "review": review or ""})
+
+    def _job_call(self, job: Job, action: str, body: dict) -> None:
+        try:
+            self._call("POST", f"/jobs/{job.id}/{action}", body)
+        except AgentError as e:
+            if e.code != "lease_lost":
+                raise
+            self._cancel.add(job.id)  # lost: should_stop(job) tells the worker to drop it
+
+    def _finish(self, job: Job, action: str, body: dict) -> None:
+        if job._done:
+            return
+        try:
+            self._call("POST", f"/jobs/{job.id}/{action}", body)
+        except AgentError as e:
+            if e.code != "lease_lost":
+                raise
+            print(f"beacon_sdk: job {job.id}: lease lost, result dropped", file=sys.stderr)
+        job._done = True
+        if self._current is job:
+            self._current = None
+
+    def _abandon(self, error: str, retryable: bool, review: str | None = None) -> None:
+        job = self._current
+        if job is None or job._done:
+            return
+        try:
+            self.fail(job, error, retryable=retryable, review=review)
+        except Exception as e:
+            print(f"beacon_sdk: couldn't fail job {job.id}: {e}", file=sys.stderr)
+
+
+def check_binaries(*names: str) -> list[str]:
+    """Self-check helper: the binaries that aren't on PATH."""
+    return [n for n in names if shutil.which(n) is None]
