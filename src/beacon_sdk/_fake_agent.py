@@ -1,4 +1,5 @@
-"""A fake agent local API (/local/v1) for the SDK's tests: it queues jobs and records every call."""
+"""A fake agent local API (/local/v1): it queues jobs and records every call. Used by the SDK's tests
+and by `python -m beacon_sdk.dev`."""
 
 from __future__ import annotations
 
@@ -12,7 +13,8 @@ TOKEN = "test-worker-token"
 
 
 class FakeAgent:
-    def __init__(self) -> None:
+    def __init__(self, on_call=None) -> None:
+        self.on_call = on_call  # (method, path, body), after the call is recorded
         self.jobs: list[dict] = []  # handed out by /jobs/claim, in order
         self.calls: list[tuple[str, str, dict]] = []  # (method, path, body)
         self.stop_requested = False
@@ -44,6 +46,8 @@ class FakeAgent:
                 with agent._lock:
                     agent.calls.append((method, path, body))
                 status, data = agent.route(method, path, body)
+                if agent.on_call:
+                    agent.on_call(method, path, body)
                 if status >= 400:
                     return self._answer(status, {"success": False, "code": data, "message": data})
                 self._answer(status, {"success": True, "data": data})

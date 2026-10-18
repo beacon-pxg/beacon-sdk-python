@@ -26,13 +26,29 @@ Scrapers also get `secrets()` (the source's cookies and proxy, never stored on d
 `self_check(binaries=[...], config=[...])` returns what's wrong at start-up (missing binaries or
 installation config keys); the worker decides whether to exit.
 
+## Running a worker without Beacon
+
+`python -m beacon_sdk.dev` runs the worker in the current folder on one job, against a fake agent, and
+prints what it reports (works, releases, progress, logs, outputs, complete/fail):
+
+```bash
+uv run python -m beacon_sdk.dev scrape   https://site.example
+uv run python -m beacon_sdk.dev check    https://site.example/work/17/ [--known 3]
+uv run python -m beacon_sdk.dev download https://site.example/work/17/1/ -c page_image="div.reader img"
+uv run python -m beacon_sdk.dev process  --input video=clip.mp4 -p preset=hh_dual
+```
+
+The config, params and source come from `dev.toml` (keep it out of git: it can hold cookies), with
+`-c key=value` / `-p key=value` on top, checked against the worker's schemas. Files land in `./out/`.
+`--json` prints one raw line per call. `python -m beacon_sdk.dev -h` shows the `dev.toml` keys.
+
 ## Tests
 
 ```bash
 uv run python -m unittest discover -s tests -v
 ```
 
-They run against a fake agent (`tests/fake_agent.py`). Beacon's CI also runs the SDK against the real
+They run against a fake agent (`beacon_sdk._fake_agent`, the same one `dev` uses). Beacon's CI also runs the SDK against the real
 agent (`TestSDKContract` in `beacon/cmd/beacon-agent`).
 
-Status: v0.4, the whole contract of `docs/05-workers.md` §6.
+Status: v0.5, the whole contract of `docs/05-workers.md` §6.

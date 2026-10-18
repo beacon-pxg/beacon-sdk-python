@@ -1,4 +1,4 @@
-"""The SDK against a fake agent (tests/fake_agent.py). Run: uv run python -m unittest discover -s tests -v"""
+"""The SDK against a fake agent (beacon_sdk._fake_agent). Run: uv run python -m unittest discover -s tests -v"""
 
 from __future__ import annotations
 
@@ -12,10 +12,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from fake_agent import TOKEN, FakeAgent
-
 import beacon_sdk
 from beacon_sdk import _worker
+from beacon_sdk._fake_agent import TOKEN, FakeAgent
 
 SRC = str(Path(__file__).resolve().parent.parent / "src")
 
