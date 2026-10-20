@@ -1,6 +1,6 @@
 [project]
 name = "beacon-sdk"
-version = "0.6.1"
+version = "0.6.2"
 description = "The only way Beacon workers talk to the agent on their node."
 requires-python = ">=3.12"
 dependencies = []

@@ -102,6 +102,17 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(got, {"/jobs/job_1/fail": (False, "selector changed"), "/jobs/job_2/fail": (True, ""),
                                "/jobs/job_3/fail": (True, "")})
 
+    def test_run_leaves_a_job_unfinished_when_stopping(self) -> None:
+        self.agent.job("job_1")
+        w = self.worker()
+
+        def handle(job):
+            w._stop.set()  # the agent asked to stop mid-job; the worker lets go of it
+            return
+
+        w.run(handle)
+        self.assertEqual(self.agent.finals(), [], "no final call: the agent reports it as interrupted")
+
     def test_beacon_unreachable_is_waited_out(self) -> None:
         self.agent.job("job_1")
         self.agent.unreachable = 2  # Beacon restarting: two 503s, then it answers

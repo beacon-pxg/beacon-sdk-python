@@ -209,7 +209,11 @@ class Worker:
                 traceback.print_exc()
                 self.fail(job, f"{type(e).__name__}: {e}", retryable=True)
             else:
-                if not job._done:
+                if not job._done and self._stop.is_set():
+                    # Stopping (restart, update): left unfinished on purpose. The agent hands it back to
+                    # Beacon as interrupted when this process exits, without using an attempt.
+                    print(f"beacon_sdk: job {job.id}: left for the next start", file=sys.stderr)
+                elif not job._done:
                     self.fail(job, "the worker returned without finishing the job", retryable=True)
         except Exception as e:  # noqa: BLE001 - the agent is gone; the lease expires and Beacon retries
             print(f"beacon_sdk: job {job.id}: {e}", file=sys.stderr)
