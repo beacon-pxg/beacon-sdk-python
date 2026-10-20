@@ -281,6 +281,8 @@ class Worker:
                 self._held.remove(job)
 
     def _abandon(self, error: str, retryable: bool, review: str | None = None) -> None:
+        if self._stop.is_set():
+            return  # stopping: the agent requeues what's unfinished as interrupted, without an attempt
         with self._held_lock:
             held = list(self._held)
         for job in held:
