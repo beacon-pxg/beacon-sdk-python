@@ -69,6 +69,39 @@ class WorkerTest(unittest.TestCase):
         log = next(b for _, p, b in self.agent.calls if p.endswith("/log"))
         self.assertEqual(log["fields"], {"pages": 3})
 
+    def test_run_takes_jobs_while_others_run(self) -> None:
+        self.agent.job("job_1")
+        self.agent.job("job_2")
+        w = self.worker()
+        both = threading.Barrier(2, timeout=2)  # each job waits for the other: only passes if they overlap
+
+        def handle(job):
+            both.wait()
+            w.complete(job)
+
+        self.stop_after(0.5)
+        w.run(handle)
+        self.assertEqual(sorted(p for p, _ in self.agent.finals()), ["/jobs/job_1/complete", "/jobs/job_2/complete"])
+
+    def test_run_outcomes(self) -> None:
+        self.agent.job("job_1", kind="review")
+        self.agent.job("job_2", kind="boom")
+        self.agent.job("job_3", kind="forgot")
+        w = self.worker()
+
+        def handle(job):
+            if job.payload["kind"] == "review":
+                raise beacon_sdk.NeedsReview("selector changed")
+            if job.payload["kind"] == "boom":
+                raise ValueError("bad page")
+
+        self.stop_after(0.5)
+        with mock.patch("traceback.print_exc"):
+            w.run(handle)
+        got = {p: (b["retryable"], b["review"]) for p, b in self.agent.finals()}
+        self.assertEqual(got, {"/jobs/job_1/fail": (False, "selector changed"), "/jobs/job_2/fail": (True, ""),
+                               "/jobs/job_3/fail": (True, "")})
+
     def test_moving_on_without_finishing_fails_the_job(self) -> None:
         self.agent.job("job_1")
         w = self.worker()

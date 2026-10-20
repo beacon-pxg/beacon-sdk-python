@@ -7,10 +7,11 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 HEARTBEAT_S = 10
 CLAIM_WAIT_S = 30
@@ -58,7 +59,8 @@ class Worker:
         self.work_root = os.environ.get("BEACON_WORK_ROOT", ".")
         self._stop = threading.Event()
         self._cancel: set[str] = set()
-        self._current: Job | None = None
+        self._held: list[Job] = []  # claimed and not finished; run() holds several at once
+        self._held_lock = threading.Lock()
         self._throttle_lock = threading.Lock()
         self._next_request, self._gap, self._rate_checked = 0.0, 0.0, -1e9
         self._beat()
@@ -165,8 +167,44 @@ class Worker:
 
     # ---- jobs ----
 
+    def run(self, handle: Callable[[Job], Any]) -> None:
+        """Runs handle(job) for every job, several at once: it keeps claiming while jobs run, and the
+        agent hands out up to the installation's max_concurrency (edited in Beacon, applied live), so a
+        long scrape doesn't hold back downloads. Each job runs in its own thread; throttle() is shared,
+        so the source's rate limit holds across them. An exception from handle chooses the outcome
+        (NeedsReview: review; anything else: retryable). Returns once the agent asks the worker to stop
+        and the running jobs end."""
+        threads: list[threading.Thread] = []
+        for job in self._claims():
+            t = threading.Thread(target=self._run_one, args=(handle, job), name=f"beacon-{job.id}", daemon=True)
+            t.start()
+            threads = [x for x in threads if x.is_alive()] + [t]
+        for t in threads:
+            t.join()
+
+    def _run_one(self, handle: Callable[[Job], Any], job: Job) -> None:
+        try:
+            try:
+                handle(job)
+            except NeedsReview as e:
+                self.fail(job, str(e), retryable=False, review=str(e))
+            except Exception as e:  # noqa: BLE001 - any other failure is retryable
+                traceback.print_exc()
+                self.fail(job, f"{type(e).__name__}: {e}", retryable=True)
+            else:
+                if not job._done:
+                    self.fail(job, "the worker returned without finishing the job", retryable=True)
+        except Exception as e:  # noqa: BLE001 - the agent is gone; the lease expires and Beacon retries
+            print(f"beacon_sdk: job {job.id}: {e}", file=sys.stderr)
+
     def jobs(self) -> Iterator[Job]:
-        """Jobs for this worker, one at a time; ends when the agent asks to stop."""
+        """Jobs for this worker, one at a time; ends when the agent asks to stop. run() takes several."""
+        for job in self._claims():
+            yield job  # an exception in the loop body ends the program: the excepthook fails the job
+            if not job._done:
+                self.fail(job, "the worker moved on without finishing the job", retryable=True)
+
+    def _claims(self) -> Iterator[Job]:
         while not self._stop.is_set():
             try:
                 data = self._call("POST", "/jobs/claim", {"wait_s": CLAIM_WAIT_S}, timeout=CLAIM_WAIT_S + 15)
@@ -179,10 +217,9 @@ class Worker:
             job = Job(id=data["id"], type=data["type"], attempt=data.get("attempt", 1), payload=data.get("payload") or {},
                       inputs=data.get("inputs") or [], params=data.get("params") or {}, out_dir=data["out_dir"],
                       idempotency_key=data.get("idempotency_key", ""))
-            self._current = job
-            yield job  # an exception in the loop body ends the program: the excepthook fails the job
-            if not job._done:
-                self.fail(job, "the worker moved on without finishing the job", retryable=True)
+            with self._held_lock:
+                self._held.append(job)
+            yield job
 
     def progress(self, job: Job, pct: int, message: str = "") -> None:
         self._job_call(job, "progress", {"pct": int(pct), "message": message})
@@ -218,17 +255,20 @@ class Worker:
                 raise
             print(f"beacon_sdk: job {job.id}: lease lost, result dropped", file=sys.stderr)
         job._done = True
-        if self._current is job:
-            self._current = None
+        with self._held_lock:
+            if job in self._held:
+                self._held.remove(job)
 
     def _abandon(self, error: str, retryable: bool, review: str | None = None) -> None:
-        job = self._current
-        if job is None or job._done:
-            return
-        try:
-            self.fail(job, error, retryable=retryable, review=review)
-        except Exception as e:
-            print(f"beacon_sdk: couldn't fail job {job.id}: {e}", file=sys.stderr)
+        with self._held_lock:
+            held = list(self._held)
+        for job in held:
+            if job._done:
+                continue
+            try:
+                self.fail(job, error, retryable=retryable, review=review)
+            except Exception as e:
+                print(f"beacon_sdk: couldn't fail job {job.id}: {e}", file=sys.stderr)
 
 
 def check_binaries(*names: str) -> list[str]:
