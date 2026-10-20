@@ -15,6 +15,9 @@ from typing import Any, Callable, Iterator
 
 HEARTBEAT_S = 10
 CLAIM_WAIT_S = 30
+# How long a call waits out "Beacon is unreachable" (a restart, a deploy) before giving up. A job that
+# gives up stays held by the agent until the worker restarts. ponytail: no buffering past that.
+UNREACHABLE_RETRY_S = 600
 
 
 class Retryable(Exception):
@@ -81,7 +84,21 @@ class Worker:
 
     # ---- transport ----
 
-    def _call(self, method: str, path: str, body: Any = None, timeout: float = 40) -> Any:
+    def _call(self, method: str, path: str, body: Any = None, timeout: float = 40, retry: bool = True) -> Any:
+        """One local API call. A 503 (the agent can't reach Beacon) is retried with backoff for
+        UNREACHABLE_RETRY_S, so a Beacon restart doesn't drop the jobs in flight."""
+        deadline, wait = time.monotonic() + UNREACHABLE_RETRY_S, 1.0
+        while True:
+            try:
+                return self._call_once(method, path, body, timeout)
+            except AgentError as e:
+                if not retry or e.status != 503 or time.monotonic() + wait > deadline:
+                    raise
+                print(f"beacon_sdk: {path}: {e}; retrying in {wait:.0f}s", file=sys.stderr)
+                time.sleep(wait)
+                wait = min(wait * 2, 30)
+
+    def _call_once(self, method: str, path: str, body: Any, timeout: float) -> Any:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(self._url + path, data=data, method=method,
                                      headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"})
@@ -98,7 +115,7 @@ class Worker:
         return env.get("data")
 
     def _beat(self) -> None:
-        data = self._call("POST", "/heartbeat", {}) or {}
+        data = self._call("POST", "/heartbeat", {}, retry=False) or {}
         if data.get("stop_requested"):
             self._stop.set()
         self._cancel = set(data.get("cancel") or [])
@@ -207,7 +224,7 @@ class Worker:
     def _claims(self) -> Iterator[Job]:
         while not self._stop.is_set():
             try:
-                data = self._call("POST", "/jobs/claim", {"wait_s": CLAIM_WAIT_S}, timeout=CLAIM_WAIT_S + 15)
+                data = self._call("POST", "/jobs/claim", {"wait_s": CLAIM_WAIT_S}, timeout=CLAIM_WAIT_S + 15, retry=False)
             except (AgentError, OSError) as e:
                 print(f"beacon_sdk: claim failed: {e}", file=sys.stderr)
                 self._stop.wait(5)

@@ -102,6 +102,18 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(got, {"/jobs/job_1/fail": (False, "selector changed"), "/jobs/job_2/fail": (True, ""),
                                "/jobs/job_3/fail": (True, "")})
 
+    def test_beacon_unreachable_is_waited_out(self) -> None:
+        self.agent.job("job_1")
+        self.agent.unreachable = 2  # Beacon restarting: two 503s, then it answers
+        w = self.worker()
+        self.stop_after(0.5)
+        with mock.patch.object(_worker.time, "sleep"):
+            for job in w.jobs():
+                w.complete(job, {"ok": True})
+        # Two 503s and the call that lands; no fail on the way.
+        self.assertEqual([p for p, _ in self.agent.finals()], ["/jobs/job_1/complete"] * 3)
+        self.assertEqual(self.agent.unreachable, 0)
+
     def test_moving_on_without_finishing_fails_the_job(self) -> None:
         self.agent.job("job_1")
         w = self.worker()

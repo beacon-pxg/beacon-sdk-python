@@ -20,6 +20,7 @@ class FakeAgent:
         self.stop_requested = False
         self.cancel: list[str] = []
         self.lost: set[str] = set()  # job ids that answer 409 lease_lost
+        self.unreachable = 0  # the next job calls answer 503, as when Beacon restarts
         self.config = {"installation": {"quality": 80}, "source": {"slug": "s", "rate_limit": {"requests": 10, "per_s": 1}}}
         self.secrets = {"cookies": "a=b", "proxy_url": None}
         self._lock = threading.Lock()
@@ -82,6 +83,9 @@ class FakeAgent:
             return 200, {"new": len(body.get("works", []))}
         m = re.fullmatch(r"/jobs/([^/]+)/(progress|log|outputs|complete|fail)", path)
         if m:
+            if self.unreachable > 0:
+                self.unreachable -= 1
+                return 503, "service_unavailable"
             if m.group(1) in self.lost:
                 return 409, "lease_lost"
             return 200, None
