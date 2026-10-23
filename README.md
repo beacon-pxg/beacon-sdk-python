@@ -9,12 +9,56 @@ The contract it implements is `docs/05-workers.md` in the `beacon` repo.
 
 ## Quick start
 
-A complete converter: it takes a video, writes a file and hands it on.
+A scraper runs three kinds of job: `scrape` walks the site's catalog and reports its works, `check`
+looks at one work and reports its releases, and `download` saves one release's files.
+
+```python
+from beacon_sdk import NeedsReview, Worker
+
+w = Worker()  # reads the agent's environment and starts heartbeating
+
+
+def scrape(job):
+    for batch in list_catalog(job.payload):  # your code: pages of [{url, external_id?, title?}]
+        if w.should_stop(job):
+            return
+        w.throttle()  # before each request to the site
+        w.discover_works(job, batch)
+    w.complete(job)
+
+
+def check(job):
+    work = job.payload["work"]
+    title, releases = read_work(work["url"])  # your code: [{number, title?, url?}]
+    if not releases:
+        raise NeedsReview(f"nothing at {work['url']}")
+    new = w.discover_releases(job, releases, work={"title": title})
+    w.complete(job, {"new": new})
+
+
+def download(job):
+    for path in save_files(job.payload["release"]["url"], job.out_dir):  # your code
+        w.output(job, "images", path)
+    w.complete(job)
+
+
+RUN = {"scrape": scrape, "check": check, "download": download}
+w.run(lambda job: RUN[job.type](job))
+```
+
+`secrets()` gives the source's cookies and proxy, and `config()["source"]` its base URL and rate
+limit. A full example against a real site is `scraper-example-python`.
+
+The function given to `run()` runs once per job. Write everything under `job.out_dir`, register what
+the next step needs with `output()`, and end with `complete()`. Check `should_stop(job)` in long loops: it turns true
+when the worker is stopping or Beacon cancelled that job.
+
+A converter: it takes a video, writes a file and hands it on.
 
 ```python
 from beacon_sdk import Worker
 
-w = Worker()  # reads the agent's environment and starts heartbeating
+w = Worker()
 
 
 def handle(job):
@@ -27,10 +71,6 @@ def handle(job):
 
 w.run(handle)  # returns when the agent asks the worker to stop
 ```
-
-`handle` runs once per job. Write everything under `job.out_dir`, register what the next step needs
-with `output()`, and end with `complete()`. Check `should_stop(job)` in long loops: it turns true
-when the worker is stopping or Beacon cancelled that job.
 
 ## Add it to a worker
 
@@ -59,7 +99,7 @@ To run it without Beacon, see [Run a worker locally](#run-a-worker-locally).
 
 Each job ends exactly once, and the SDK makes sure it does even if the code doesn't:
 
-| In `handle` | Outcome in Beacon |
+| In the job function | Outcome in Beacon |
 | --- | --- |
 | `w.complete(job, result)` | Succeeded; its outputs go to the next step |
 | `raise NeedsReview("why")` | Failed, and the release waits for a person to review it |
