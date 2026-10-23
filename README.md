@@ -37,8 +37,10 @@ def check(job):
 
 
 def download(job):
-    for path in save_files(job.payload["release"]["url"], job.out_dir):  # your code
+    url = job.payload["release"]["url"]
+    for path in save_files(url, job.out_dir):  # your code
         w.output(job, "images", path)
+    w.output(job, "data", write_data_json(url, job.out_dir))  # your code: the site's own fields
     w.complete(job)
 
 
@@ -50,7 +52,9 @@ w.run(lambda job: RUN[job.type](job))
 limit. A full example against a real site is `scraper-example-python`.
 
 The function given to `run()` runs once per job. Write everything under `job.out_dir`, register what
-the next step needs with `output()`, and end with `complete()`. Check `should_stop(job)` in long loops: it turns true
+the next step needs with `output()`, and end with `complete()`. A `download` also registers the
+scraper's own `data.json` on the `data` port, in whatever shape the site gives: Beacon zips it as is
+with the files, and the Hub site maps it. The scraper never zips or uploads. Check `should_stop(job)` in long loops: it turns true
 when the worker is stopping or Beacon cancelled that job.
 
 A converter: it takes a video, writes a file and hands it on.
@@ -117,7 +121,7 @@ An exception that kills the whole process fails its held jobs the same way.
 | `config()` | all | `{"installation": {...}, "source": {...}}`: the installation's config and, for scrapers, the source |
 | `progress(job, pct, message)` | all | Progress shown on the job and release pages |
 | `log(job, level, message, **fields)` | all | A line in the job's log |
-| `output(job, port, path)` | all | Registers a file in `job.out_dir` for a pipeline port (`video`, `images`…) |
+| `output(job, port, path)` | all | Registers a file in `job.out_dir` for a pipeline port (`video`, `images`…), or a scraper's `data.json` on `data` |
 | `complete(job, result)` / `fail(job, …)` | all | Ends the job (above) |
 | `should_stop(job)` | all | True when stopping or the job was cancelled |
 | `secrets()` | scrapers | The source's cookies and proxy. Keep them in memory, never on disk |
